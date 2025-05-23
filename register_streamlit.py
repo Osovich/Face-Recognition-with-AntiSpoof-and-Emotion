@@ -1,24 +1,26 @@
 import streamlit as st
 import torch
-import torch.nn as nn
 from torchvision import transforms
 import cv2
 from PIL import Image
 import numpy as np
 import os
 from face_recognition.embnet import EmbNet
+from face_recognition.recognition_utils import recognize_face
+import torch.nn.functional as F
 
 # ========== CONFIG ==========
 MODEL_PATH = "models/embnet_triplet_15k.pth"
 CLASS_DB_PATH = "models/class_db.pt"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 
+# ========== MODEL & UTILS ==========
 @st.cache_resource(show_spinner=True)
 def load_embnet(model_path, device="cpu"):
     model = EmbNet(dim=256).to(device)
     ckpt = torch.load(model_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
-    model.to(DEVICE)
     model.eval()
     return model
 
@@ -41,69 +43,62 @@ def save_class_db(class_db, path):
     torch.save(class_db, path)
 
 # ========== STREAMLIT UI ==========
-st.title("Face Registration (Webcam)")
+st.title("Face Registration & Recognition (Webcam)")
 
-model = load_embnet(MODEL_PATH)
+model = load_embnet(MODEL_PATH, device=DEVICE)
 class_db = load_class_db(CLASS_DB_PATH)
-
-if 'frame' not in st.session_state:
-    st.session_state['frame'] = None
-if 'captured_frame' not in st.session_state:
-    st.session_state['captured_frame'] = None
-
-name = st.text_input("Enter your name to register")
+face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
 
 frame_placeholder = st.empty()
 capture_btn = st.button("Capture Face")
-register_btn = st.button("Register Face")
+name = st.text_input("Enter your name to register")
 
-# Main LIVE webcam loop
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
+capture = cv2.VideoCapture(0)
+if not capture.isOpened():
     st.warning("Webcam not found!")
 else:
-    # Stream webcam until user interrupts
     while True:
-        ret, frame = cap.read()
+        ret, frame = capture.read()
         if not ret:
-            st.warning("Can't read from webcam!")
             break
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_placeholder.image(frame_rgb, channels="RGB", caption="Webcam Live")
-        st.session_state['frame'] = frame  # Always keep the latest frame
+        faces = face_cascade.detectMultiScale(frame_rgb, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
 
-        # Stop the loop if user interacts (e.g., presses a Streamlit button)
-        if capture_btn or register_btn:
-            break
-    cap.release()
+        # Recognize and annotate faces
+        for (x, y, w, h) in faces:
+            face_img = frame_rgb[y:y+h, x:x+w]
+            pil_face = Image.fromarray(face_img)
+            image_tensor = preprocess(pil_face)
+            user, sim = recognize_face(image_tensor, model, class_db, threshold=0.7, device=DEVICE)
+            label = user if user else "Unknown"
+            # Draw rectangle and name
+            cv2.rectangle(frame_rgb, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.putText(frame_rgb, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,0,0), 2)
 
-# If capture button is pressed, store the frame
-if capture_btn and st.session_state['frame'] is not None:
-    st.session_state['captured_frame'] = st.session_state['frame'].copy()
-    st.success("Face captured! Now you can register with your name.")
+        frame_placeholder.image(frame_rgb, channels="RGB", caption="Webcam Live (Recognition)")
 
-# Show the captured frame and user prompt
-if st.session_state['captured_frame'] is not None:
-    st.image(st.session_state['captured_frame'][:, :, ::-1], channels="RGB", caption="Captured Face")
+        if capture_btn:
+            # For registration: use the biggest detected face (if any)
+            if len(faces) > 0 and name:
+                x, y, w, h = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
+                pil_face = Image.fromarray(frame_rgb[y:y+h, x:x+w])
+                image_tensor = preprocess(pil_face)
+                emb = model(image_tensor.to(DEVICE)).cpu().flatten()
+                emb = F.normalize(emb, dim=0)  # Consistent normalization with recognition_utils
+                class_db[name] = emb
+                save_class_db(class_db, CLASS_DB_PATH)
+                st.success(f"Registered new user: {name}")
+            elif len(faces) == 0:
+                st.warning("No face detected for registration.")
+            elif not name:
+                st.warning("Please enter your name before registering.")
+            break  # End webcam loop after registration
 
-if register_btn:
-    if name and st.session_state['captured_frame'] is not None:
-        img = Image.fromarray(st.session_state['captured_frame'][:, :, ::-1])
-        image_tensor = preprocess(img).to(DEVICE)
-        with torch.no_grad():
-            emb = model(image_tensor).cpu().flatten()
-        class_db[name] = emb
-        try:
-            save_class_db(class_db, CLASS_DB_PATH)
-            st.success(f"Registered new user: {name}")
-        except Exception as e:
-            st.error(f"Failed to save database: {e}")
-    elif not name:
-        st.warning("Please enter your name before registering.")
-    elif st.session_state['captured_frame'] is None:
-        st.warning("Please capture a face before registering.")
+    capture.release()
 
-# Sidebar: show registered users
+st.info("Live recognition: your name will appear above your face if registered.")
+
+# Registered users in sidebar
 with st.sidebar:
     st.header("Registered Users")
     if class_db:
